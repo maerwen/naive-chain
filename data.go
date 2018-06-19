@@ -25,6 +25,7 @@ func (b *Block) String() string {
 }
 
 // OrderedBlockchain	及实现一些方法,方便使用ｓｏｒｔ进行排序
+// 直接把blockchain定义成struct之后，无法使用索引和预声明的len（）函数
 type OrderedBlockchain []*Block
 
 func (b OrderedBlockchain) Len() int {
