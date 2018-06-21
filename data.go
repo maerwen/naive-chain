@@ -38,8 +38,9 @@ func (b OrderedBlockchain) Less(i, j int) bool {
 	return b[i].Index < b[j].Index
 }
 
-// ResponseBlockchain
-type ResponseBlockchain struct {
+// Ｍｓｇ
+// 接受各节点之间通信数据
+type Msg struct {
 	Type int    `json:"type"`
 	Data string `json:"data"`
 }
@@ -48,9 +49,18 @@ type ResponseBlockchain struct {
 // post请求请求实体中的一项数值，用以对请求进行区分相应
 // wsHandleP2P方法中调用
 const (
-	queryLatest = iota
-	queryAll
-	responseBlockchain
+	// 查询最新区块
+	QUERY_LATEST_BLOCK = iota
+	// 查询整个链条
+	QUERY_BLOCKCHAIN
+	// 接收到广播消息，进行区块链更新
+	UPDATE_BLOCKCHAIN
+	// 添加一笔新的交易信息，生成新区块
+	ADD_NEW_DATA
+	// 查询所有节点
+	QUERY_ALL_PEER
+	// 新增节点
+	ADD_NEW_PEER
 )
 
 // 全局变量
@@ -59,12 +69,13 @@ var genesisBlock *Block
 
 func init() {
 	genesisBlock = &Block{0, time.Now().Unix(), "my genesis block!!", "", ""}
+	blockchain = append(blockchain, genesisBlock)
 }
 
 var (
+	blockchain = []*Block{}
 	// peer集合
-	sockets    []*websocket.Conn
-	blockchain = []*Block{genesisBlock}
+	sockets []*websocket.Conn
 	// 从命令行输入的参数
 	httpAddr     = flag.String("api", ":3001", "api server address")
 	p2pAddr      = flag.String("p2p", ":6001", "p2p server address")

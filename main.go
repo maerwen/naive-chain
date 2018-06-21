@@ -3,17 +3,77 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/net/websocket"
 )
 
 func main() {
+	// 读取命令行参数
+	flag.Parse()
+	connectToPeers(strings.Split(*initialPeers, ","))
+	// 处理本地事务
+	http.HandleFunc("/", homeHandle)
+	// 为什么放到ｇｏ协程中去？
+	go func() {
+		log.Println("Listen HTTP on", *httpAddr)
+		errFatal("start api server", http.ListenAndServe(*httpAddr, nil))
+	}()
+	// 处理ｐ２ｐ事务
+	http.Handle("/p2p/", websocket.Handler(wsHandleP2P))
+	log.Println("Listen P2P on ", *p2pAddr)
+	errFatal("start p2p server", http.ListenAndServe(*p2pAddr, nil))
+}
+func homeHandle(w http.ResponseWriter, r *http.Request) {
+	uri := r.RequestURI
+	if uri == "/favicon.ico" {
+		return
+	}
+	if r.Method == "GET" {
+		handleBlocks(w, r)
+	} else {
+		msg := parseRequestBody(r)
+		switch msg.Type {
+		case ADD_NEW_DATA: //3
+			handleMineBlock(msg.Data)
+			fallthrough
+		case QUERY_LATEST_BLOCK: //0
+			queryLatestBlock(w)
+		case ADD_NEW_PEER: //5
+			handleAddPeer(msg.Data)
+			fallthrough
+		case QUERY_ALL_PEER: //4
+			handlePeers(w)
+		default:
+		}
+	}
+}
 
+// 请求实体数据读取
+func parseRequestBody(r *http.Request) *Msg {
+	msg := &Msg{}
+	buff := []byte{}
+	//为什么以下两种方式无法读取出来数据,报错unexpected end of JSON input
+	// dec := json.NewDecoder(r.Body)
+	// err := dec.Decode(&msg)
+
+	// n, err := r.Body.Read(buff)
+
+	buff, err := ioutil.ReadAll(r.Body)
+	defer r.Body.Close()
+	errFatal("read request body failed:", err)
+	// fmt.Println(len(buff))
+	err = json.Unmarshal(buff, msg)
+	errFatal("json unmarshal msg failed:", err)
+	return msg
 }
 
 // 函数定义
@@ -25,8 +85,8 @@ func errFatal(msg string, err error) {
 }
 
 // connectToPeers连接到各个节点
-func connectToPeers(peersAddr []string) {
-	for _, peer := range peersAddr {
+func connectToPeers(newPeersAddr []string) {
+	for _, peer := range newPeersAddr {
 		if peer == "" {
 			continue
 		}
@@ -45,18 +105,19 @@ func initConnection(ws *websocket.Conn) {
 	go wsHandleP2P(ws)
 	log.Println("query latest block...")
 	// 响应消息
-	ws.Write(queryLatestMsg())
+	ws.Write(queryLatestTrade())
 }
 
-// queryLatestMsg
-func queryLatestMsg() []byte {
-	return []byte(fmt.Sprintf("{\"type\":%d}", queryLatest))
+// queryLatestTrade
+// 查询最新的区块所记录的交易
+func queryLatestTrade() []byte {
+	return []byte(fmt.Sprintf("{\"type\":%d}", QUERY_LATEST_BLOCK))
 }
 
 // wsHandleP2P
 func wsHandleP2P(ws *websocket.Conn) {
 	// 构建用来接收请求数据的数据实体
-	v := &ResponseBlockchain{}
+	v := &Msg{}
 	peer := ws.LocalAddr().String()
 	sockets = append(sockets, ws)
 	for {
@@ -77,17 +138,17 @@ func wsHandleP2P(ws *websocket.Conn) {
 		errFatal("invalid p2p msg", err)
 		switch v.Type {
 		// 查询最近的收到的消息
-		case queryLatest:
-			bs := responseMsg(queryLatest)
+		case QUERY_LATEST_BLOCK:
+			bs := responseMsg(QUERY_LATEST_BLOCK)
 			log.Printf("responseLatestMsg: %s\n", bs)
 			ws.Write(bs)
 		// 查询所有的收到的消息
-		case queryAll:
-			bs := responseMsg(queryAll)
+		case QUERY_BLOCKCHAIN:
+			bs := responseMsg(QUERY_BLOCKCHAIN)
 			log.Printf("responseChainMsg: %s\n", bs)
 			ws.Write(bs)
-		// 接收到区块链数据
-		case responseBlockchain:
+		// 接收到有区块链数据更新的通知
+		case UPDATE_BLOCKCHAIN:
 			handleBlockchainResponse([]byte(v.Data))
 		}
 	}
@@ -95,12 +156,12 @@ func wsHandleP2P(ws *websocket.Conn) {
 
 // responseMsg
 func responseMsg(responseType int) []byte {
-	v := &ResponseBlockchain{Type: responseBlockchain}
+	v := &Msg{Type: UPDATE_BLOCKCHAIN}
 	d := []byte{}
-	if responseType == queryLatest {
+	if responseType == QUERY_LATEST_BLOCK {
 		d, _ = json.Marshal(blockchain[len(blockchain)-1:])
 	}
-	if responseType == queryAll {
+	if responseType == QUERY_BLOCKCHAIN {
 		d, _ = json.Marshal(blockchain)
 	}
 	v.Data = string(d)
@@ -129,7 +190,7 @@ func handleBlockchainResponse(msg []byte) {
 			// 为什么这个数值取１？
 			// 接收到的区块链只有一个区块
 			log.Println("We have to query the chain from our peer.")
-			broadcast(queryAllMsg())
+			broadcast(queryBlockchain())
 		} else {
 			// 本地存储的区块链已经落后
 			log.Println("Received blockchain is longer than current blockchain.")
@@ -144,8 +205,16 @@ func handleBlockchainResponse(msg []byte) {
 func getLatestBlock() *Block {
 	return blockchain[len(blockchain)-1]
 }
+func queryLatestBlock(w http.ResponseWriter) {
+	buff, err := json.Marshal(getLatestBlock())
+	if err != nil {
+		http.Error(w, "json marshal bolck failed:"+err.Error(), 500)
+	}
+	w.Write(buff)
+}
 
 // broadcast
+// 发送广播，向其他节点传递消息
 func broadcast(msg []byte) {
 	for _, socket := range sockets {
 		// for n, socket := range sockets {
@@ -158,9 +227,9 @@ func broadcast(msg []byte) {
 	}
 }
 
-// queryAllMsg
-func queryAllMsg() []byte {
-	return []byte(fmt.Sprintf("{\"type\":%d}", queryAll))
+// queryBlockchain
+func queryBlockchain() []byte {
+	return []byte(fmt.Sprintf("{\"type\":%d}", QUERY_BLOCKCHAIN))
 }
 
 // replaceChain
@@ -168,18 +237,14 @@ func replaceChain(chain []*Block) {
 	if isValidChain(chain) && len(chain) > len(blockchain) {
 		log.Println("Received blockchain is valid. Replacing current blockchain with received blockchain.")
 		blockchain = chain
-		broadcast(responseMsg(queryLatest))
+		broadcast(responseMsg(QUERY_LATEST_BLOCK))
 	} else {
 		log.Println("Received blockchain invalid.")
 	}
 }
 
 // isValidChain
-// 开头结尾验证
-// 索引，ｈａｓｈ．
-// 如果chain是已有ｂｌｏｃｋchain的子集，验证开头与结尾对应的索引及ｈａｓｈ
-// 如果不是...
-// 链条必须是从０开始吗？
+// 每个节点本地存储的链条都必须是从创世块开始！！！
 func isValidChain(chain []*Block) bool {
 	if chain[0].String() != genesisBlock.String() {
 		log.Println("No same GenesisBlock.", chain[0].String())
@@ -197,11 +262,12 @@ func isValidChain(chain []*Block) bool {
 }
 
 // isValidBlock
+// 判断当前区块是否有效
 func isValidBlock(newBlock, oldBlock *Block) bool {
 	if newBlock.Index != oldBlock.Index+1 {
 		return false
 	}
-	if newBlock.PrevHash == oldBlock.Hash {
+	if newBlock.PrevHash != oldBlock.Hash {
 		return false
 	}
 	if calculateHashForBlock(newBlock) != newBlock.Hash {
@@ -211,6 +277,7 @@ func isValidBlock(newBlock, oldBlock *Block) bool {
 }
 
 // calculateHashForBlock
+// 根据已有参数，计算出新区块的ＨＡＳＨ值
 func calculateHashForBlock(block *Block) string {
 	var newHash string
 	str := fmt.Sprintf("%d%d%s%s", block.Index, block.Timestamp, block.Data, block.PrevHash)
@@ -218,8 +285,31 @@ func calculateHashForBlock(block *Block) string {
 	return newHash
 }
 
-// generateNextBlock
-func generateNextBlock(data string) *Block {
+// handleBlocks查询区块链，以ｊｓｏｎ格式发送给浏览器
+func handleBlocks(w http.ResponseWriter, r *http.Request) {
+	bc, _ := json.MarshalIndent(blockchain, "", " ")
+	w.Write(bc)
+}
+
+// handleMineBlock新增区块
+// 根据浏览器传入的信息生成一个新区块
+func handleMineBlock(data string) {
+	block := generateNewBlock(data)
+	addBlockToBlockchain(block)
+	broadcast(responseMsg(QUERY_LATEST_BLOCK))
+}
+
+// addBlockToBlockchain
+// 将当前区块新增到本地区块链上
+func addBlockToBlockchain(b *Block) {
+	if isValidBlock(b, getLatestBlock()) {
+		blockchain = append(blockchain, b)
+	}
+}
+
+// generateNewBlock
+// 根据下一条交易信息生成新的区块
+func generateNewBlock(data string) *Block {
 	latestBlock := getLatestBlock()
 	newBlock := &Block{
 		Index:     latestBlock.Index + 1,
@@ -231,14 +321,21 @@ func generateNextBlock(data string) *Block {
 	return newBlock
 }
 
-// addBlock
-func addBlock(b *Block) {
-	if isValidBlock(b, getLatestBlock()) {
-		blockchain = append(blockchain, b)
+// handlePeers查询节点
+func handlePeers(w http.ResponseWriter) {
+	var peers []string
+	for _, socket := range sockets {
+		if socket.IsClientConn() {
+			peers = append(peers, socket.LocalAddr().String())
+		} else {
+			peers = append(peers, socket.Request().RemoteAddr)
+		}
 	}
+	buff, _ := json.Marshal(peers)
+	w.Write(buff)
 }
 
-// handleBlocks查询区块链
-// handleMineBlock新增区块
-// handlePeers查询节点
 // handleAddPeer新增节点
+func handleAddPeer(data string) {
+	connectToPeers([]string{data})
+}
